@@ -15,8 +15,8 @@ class LibtorrentPythonConan(ConanFile):
         self.info.settings.clear()
 
     def configure(self):
-        self.options["Libtorrent"].shared=False
-        self.options["Boost"].shared=True
+        self.options["Libtorrent"].shared=True
+        self.options["Boost"].shared=False
         self.options["Boost"].python = True
         self.options["zlib"].shared=False
         self.options["bzip2"].shared=False
@@ -31,12 +31,12 @@ class LibtorrentPythonConan(ConanFile):
     def build(self):
         cmake = CMake(self.settings)
         pythonpaths = "-DPYTHON_INCLUDE_DIR=/usr/include/python2.7 -DPYTHON_LIBRARY=/usr/lib/x86_64-linux-gnu/libpython2.7.so"
-        self.run('cmake %s %s -DEXAMPLE_PYTHON_VERSION=%s' % (cmake.command_line, pythonpaths, self.options.python_version))
+        self.run('cmake src %s %s -DEXAMPLE_PYTHON_VERSION=%s' % (cmake.command_line, pythonpaths, self.options.python_version))
         self.run("cmake --build . %s" % cmake.build_config)
 
     def package(self):
         self.copy('*.py*')
-        self.copy("*.a")
+        self.copy("*.so")
 
     def package_info(self):
         self.env_info.PYTHONPATH.append(self.package_folder)
