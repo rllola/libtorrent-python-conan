@@ -2,8 +2,8 @@ from conans import ConanFile, tools, CMake
 
 class LibtorrentPythonConan(ConanFile):
     name = "LibtorrentPython"
-    version = "1.1.4"
-    requires = "Libtorrent/1.1.4@lola/stable",
+    version = "1.1.8"
+    requires = "Libtorrent/1.1.8@lola/stable",
     settings = "os", "compiler", "arch", "build_type"
     options = {"python_version": ["2.7"]}
     default_options = "python_version=2.7"
@@ -29,7 +29,7 @@ class LibtorrentPythonConan(ConanFile):
           self.options["bzip2"].fPIC=True
 
     def build(self):
-        cmake = CMake(self.settings)
+        cmake = CMake(self)
         pythonpaths = "-DPYTHON_INCLUDE_DIR=/usr/include/python2.7 -DPYTHON_LIBRARY=/usr/lib/x86_64-linux-gnu/libpython2.7.so"
         self.run('cmake src %s %s -DEXAMPLE_PYTHON_VERSION=%s' % (cmake.command_line, pythonpaths, self.options.python_version))
         self.run("cmake --build . %s" % cmake.build_config)

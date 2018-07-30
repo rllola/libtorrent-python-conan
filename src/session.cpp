@@ -12,32 +12,40 @@
 #include <libtorrent/extensions.hpp>
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/bencode.hpp>
+#include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/kademlia/item.hpp> // for sign_mutable_item
+#include <libtorrent/alert.hpp>
 #include <libtorrent/time.hpp>
 #include <libtorrent/session_stats.hpp>
 #include <libtorrent/session_status.hpp>
 
-#ifndef TORRENT_NO_DEPRECATE
-#include <libtorrent/extensions/lt_trackers.hpp>
-#include <libtorrent/extensions/metadata_transfer.hpp>
-#endif
 #include <libtorrent/extensions/smart_ban.hpp>
 #include <libtorrent/extensions/ut_metadata.hpp>
 #include <libtorrent/extensions/ut_pex.hpp>
 
+namespace boost
+{
+	// this fixes mysterious link error on msvc
+	lt::alert const volatile*
+	get_pointer(lt::alert const volatile* p)
+	{
+		return p;
+	}
+}
+
 #include "gil.hpp"
 #include "bytes.hpp"
-
-#include "libtorrent/aux_/disable_warnings_push.hpp"
-
 #include "boost_python.hpp"
 
-#include "libtorrent/aux_/disable_warnings_pop.hpp"
+#ifdef _MSC_VER
+#pragma warning(push)
+// warning C4996: X: was declared deprecated
+#pragma warning( disable : 4996 )
+#endif
 
 using namespace boost::python;
-using namespace libtorrent;
-namespace lt = libtorrent;
+using namespace lt;
 
 namespace
 {
@@ -48,7 +56,7 @@ namespace
         error_code ec;
         s.listen_on(std::make_pair(min_, max_), ec, interface, flags);
 #ifndef BOOST_NO_EXCEPTIONS
-        if (ec) throw libtorrent_exception(ec);
+        if (ec) throw system_error(ec);
 #endif
     }
 
@@ -94,12 +102,6 @@ namespace
             s.add_extension(create_ut_pex_plugin);
        else if (name == "smart_ban")
             s.add_extension(create_smart_ban_plugin);
-#ifndef TORRENT_NO_DEPRECATE
-       else if (name == "lt_trackers")
-            s.add_extension(create_lt_trackers_plugin);
-       else if (name == "metadata_transfer")
-            s.add_extension(create_metadata_plugin);
-#endif // TORRENT_NO_DEPRECATE
 
 #endif // TORRENT_DISABLE_EXTENSIONS
     }
@@ -161,31 +163,12 @@ namespace
 		return ret;
 	}
 
-	boost::shared_ptr<lt::session> make_session(boost::python::dict sett, int flags)
+	std::shared_ptr<lt::session> make_session(boost::python::dict sett, int flags)
 	{
 		settings_pack p;
 		make_settings_pack(p, sett);
-		return boost::make_shared<lt::session>(p, flags);
+		return std::make_shared<lt::session>(p, flags);
 	}
-
-#ifndef TORRENT_NO_DEPRECATE
-	void session_set_settings(lt::session& ses, object const& sett)
-	{
-		extract<session_settings> old_settings(sett);
-		if (old_settings.check())
-		{
-			allow_threading_guard guard;
-			ses.set_settings(old_settings);
-		}
-		else
-		{
-			settings_pack p;
-			make_settings_pack(p, extract<dict>(sett));
-			allow_threading_guard guard;
-			ses.apply_settings(p);
-		}
-	}
-#endif
 
 	void session_apply_settings(lt::session& ses, dict const& sett_dict)
 	{
@@ -207,8 +190,7 @@ namespace
 
 	dict min_memory_usage_wrapper()
 	{
-		settings_pack ret;
-		min_memory_usage(ret);
+		settings_pack ret = min_memory_usage();
 		return make_dict(ret);
 	}
 
@@ -219,8 +201,7 @@ namespace
 
 	dict high_performance_seed_wrapper()
 	{
-		settings_pack ret;
-		high_performance_seed(ret);
+		settings_pack ret = high_performance_seed();
 		return make_dict(ret);
 	}
 
@@ -239,90 +220,124 @@ namespace
 
     void dict_to_add_torrent_params(dict params, add_torrent_params& p)
     {
-        // torrent_info objects are always held by a shared_ptr in the python binding
-        if (params.has_key("ti") && params.get("ti") != boost::python::object())
+        list items = params.items();
+        int const len = int(boost::python::len(items));
+        for (int i = 0; i < len; i++)
         {
-           // make a copy here. We don't want to end up holding a python-owned
-           // object inside libtorrent. If the last reference goes out of scope
-           // on the C++ side, it will end up freeing the python object
-           // without holding the GIL and likely crash.
-           // https://mail.python.org/pipermail/cplusplus-sig/2007-June/012130.html
-           p.ti = boost::make_shared<torrent_info>(
-              extract<torrent_info const&>(params["ti"]));
-        }
-
-
-        if (params.has_key("info_hash"))
-            p.info_hash = sha1_hash(bytes(extract<bytes>(params["info_hash"])).arr);
-        if (params.has_key("name"))
-            p.name = extract<std::string>(params["name"]);
-        p.save_path = extract<std::string>(params["save_path"]);
-
-        if (params.has_key("resume_data"))
-        {
-            std::string resume = extract<std::string>(params["resume_data"]);
-            p.resume_data.assign(resume.begin(), resume.end());
-        }
-        if (params.has_key("storage_mode"))
-            p.storage_mode = extract<storage_mode_t>(params["storage_mode"]);
-
-        if (params.has_key("trackers"))
-        {
-            list l = extract<list>(params["trackers"]);
-            int n = boost::python::len(l);
-            for(int i = 0; i < n; i++)
-                p.trackers.push_back(extract<std::string>(l[i]));
-        }
-
-        if (params.has_key("dht_nodes"))
-        {
-            list l = extract<list>(params["dht_nodes"]);
-            int n = boost::python::len(l);
-            for(int i = 0; i < n; i++)
-                p.dht_nodes.push_back(extract<std::pair<std::string, int> >(l[i]));
-        }
+            boost::python::api::object_item item = items[i];
+            std::string const key = extract<std::string>(item[0]);
+            object const value = item[1];
+            // torrent_info objects are always held by a shared_ptr in the
+            // python binding, skip it if it is a object
+            if (key == "ti" && value != boost::python::object())
+            {
+                // make a copy here. We don't want to end up holding a python-owned
+                // object inside libtorrent. If the last reference goes out of scope
+                // on the C++ side, it will end up freeing the python object
+                // without holding the GIL and likely crash.
+                // https://mail.python.org/pipermail/cplusplus-sig/2007-June/012130.html
+                p.ti = std::make_shared<torrent_info>(
+                    extract<torrent_info const&>(value));
+                continue;
+            }
+            else if(key == "info_hash")
+            {
+                p.info_hash = sha1_hash(
+                bytes(extract<bytes>(value)).arr.data());
+                continue;
+            }
+            else if(key == "name")
+            {
+                p.name = extract<std::string>(value);
+                continue;
+            }
+            else if(key == "save_path")
+            {
+                p.save_path = extract<std::string>(value);
+                continue;
+            }
 #ifndef TORRENT_NO_DEPRECATE
-        std::string url;
-        if (params.has_key("tracker_url"))
-            p.trackers.push_back(extract<std::string>(params["tracker_url"]));
-        if (params.has_key("seed_mode"))
-            p.seed_mode = params["seed_mode"];
-        if (params.has_key("upload_mode"))
-            p.upload_mode = params["upload_mode"];
-        if (params.has_key("share_mode"))
-            p.upload_mode = params["share_mode"];
-        if (params.has_key("override_resume_data"))
-            p.override_resume_data = params["override_resume_data"];
-        if (params.has_key("apply_ip_filter"))
-            p.apply_ip_filter = params["apply_ip_filter"];
-        if (params.has_key("paused"))
-            p.paused = params["paused"];
-        if (params.has_key("auto_managed"))
-            p.auto_managed = params["auto_managed"];
-        if (params.has_key("duplicate_is_error"))
-            p.duplicate_is_error = params["duplicate_is_error"];
-        if (params.has_key("merge_resume_trackers"))
-            p.merge_resume_trackers = params["merge_resume_trackers"];
+            else if(key == "resume_data")
+            {
+                std::string resume = extract<std::string>(value);
+                p.resume_data.assign(resume.begin(), resume.end());
+                continue;
+            }
+            else if(key == "uuid")
+            {
+                p.uuid = extract<std::string>(value);
+                continue;
+            }
 #endif
-        if (params.has_key("flags"))
-            p.flags = extract<boost::uint64_t>(params["flags"]);
-
-        if (params.has_key("trackerid"))
-            p.trackerid = extract<std::string>(params["trackerid"]);
-        if (params.has_key("url"))
-            p.url = extract<std::string>(params["url"]);
-        if (params.has_key("source_feed_url"))
-            p.source_feed_url = extract<std::string>(params["source_feed_url"]);
-        if (params.has_key("uuid"))
-            p.uuid = extract<std::string>(params["uuid"]);
-
-        if (params.has_key("file_priorities"))
-        {
-            list l = extract<list>(params["file_priorities"]);
-            int n = boost::python::len(l);
-            for(int i = 0; i < n; i++)
-                p.file_priorities.push_back(extract<boost::uint8_t>(l[i]));
-            p.file_priorities.clear();
+            else if(key == "storage_mode")
+            {
+                p.storage_mode = extract<storage_mode_t>(value);
+                continue;
+            }
+            else if(key == "trackers")
+            {
+                p.trackers = extract<std::vector<std::string>>(value);
+                continue;
+            }
+            else if(key == "url_seeds")
+            {
+                p.url_seeds = extract<std::vector<std::string>>(value);
+                continue;
+            }
+            else if(key == "http_seeds")
+            {
+                p.http_seeds =
+                    extract<decltype(add_torrent_params::http_seeds)>(value);
+                continue;
+            }
+            else if(key == "dht_nodes")
+            {
+                p.dht_nodes =
+                    extract<std::vector<std::pair<std::string, int>>>(value);
+                continue;
+            }
+            else if(key == "banned_peers")
+            {
+                p.banned_peers = extract<std::vector<lt::tcp::endpoint>>(value);
+                continue;
+            }
+            else if(key == "peers")
+            {
+                p.peers = extract<std::vector<lt::tcp::endpoint>>(value);
+                continue;
+            }
+            else if(key == "flags")
+            {
+                p.flags = extract<lt::torrent_flags_t>(value);
+                continue;
+            }
+            else if(key == "trackerid")
+            {
+                p.trackerid = extract<std::string>(value);
+                continue;
+            }
+#ifndef TORRENT_NO_DEPRECATE
+            else if(key == "url")
+            {
+                p.url = extract<std::string>(value);
+                continue;
+            }
+#endif
+            else if(key == "renamed_files")
+            {
+                p.renamed_files =
+                    extract<std::map<lt::file_index_t, std::string>>(value);
+            }
+            else if(key == "file_priorities")
+            {
+                p.file_priorities = extract<std::vector<std::uint8_t>>(value);
+            }
+            else
+            {
+                PyErr_SetString(PyExc_KeyError,
+                    ("unknown name in torrent params: " + key).c_str());
+                throw_error_already_set();
+            }
         }
     }
 
@@ -355,87 +370,6 @@ namespace
     }
 
 #ifndef TORRENT_NO_DEPRECATE
-    void dict_to_feed_settings(dict params, feed_settings& feed)
-    {
-        if (params.has_key("auto_download"))
-            feed.auto_download = extract<bool>(params["auto_download"]);
-        if (params.has_key("default_ttl"))
-            feed.default_ttl = extract<int>(params["default_ttl"]);
-        if (params.has_key("url"))
-            feed.url = extract<std::string>(params["url"]);
-        if (params.has_key("add_args"))
-            dict_to_add_torrent_params(dict(params["add_args"]), feed.add_args);
-    }
-
-    feed_handle add_feed(lt::session& s, dict params)
-    {
-        feed_settings feed;
-        // this static here is a bit of a hack. It will
-        // probably work for the most part
-        dict_to_feed_settings(params, feed);
-
-        allow_threading_guard guard;
-        return s.add_feed(feed);
-    }
-
-    dict get_feed_status(feed_handle const& h)
-    {
-        feed_status s;
-        {
-            allow_threading_guard guard;
-            s = h.get_feed_status();
-        }
-        dict ret;
-        ret["url"] = s.url;
-        ret["title"] = s.title;
-        ret["description"] = s.description;
-        ret["last_update"] = s.last_update;
-        ret["next_update"] = s.next_update;
-        ret["updating"] = s.updating;
-        ret["error"] = s.error ? s.error.message() : "";
-        ret["ttl"] = s.ttl;
-
-        list items;
-        for (std::vector<feed_item>::iterator i = s.items.begin()
-            , end(s.items.end()); i != end; ++i)
-        {
-            dict item;
-            item["url"] = i->url;
-            item["uuid"] = i->uuid;
-            item["title"] = i->title;
-            item["description"] = i->description;
-            item["comment"] = i->comment;
-            item["category"] = i->category;
-            item["size"] = i->size;
-            item["handle"] = i->handle;
-            item["info_hash"] = i->info_hash.to_string();
-            items.append(item);
-        }
-        ret["items"] = items;
-        return ret;
-    }
-
-    void set_feed_settings(feed_handle& h, dict sett)
-    {
-        feed_settings feed;
-        dict_to_feed_settings(sett, feed);
-        h.set_settings(feed);
-    }
-
-    dict get_feed_settings(feed_handle& h)
-    {
-        feed_settings s;
-        {
-            allow_threading_guard guard;
-            s = h.settings();
-        }
-        dict ret;
-        ret["url"] = s.url;
-        ret["auto_download"] = s.auto_download;
-        ret["default_ttl"] = s.default_ttl;
-        return ret;
-    }
-
     void start_natpmp(lt::session& s)
     {
         allow_threading_guard guard;
@@ -449,21 +383,15 @@ namespace
     }
 #endif // TORRENT_NO_DEPRECATE
 
-#ifndef TORRENT_NO_DEPRECATE
-    boost::shared_ptr<alert>
-#else
     alert const*
-#endif
     wait_for_alert(lt::session& s, int ms)
     {
-        allow_threading_guard guard;
-        alert const* a = s.wait_for_alert(milliseconds(ms));
-#ifndef TORRENT_NO_DEPRECATE
-        if (a == NULL) return boost::shared_ptr<alert>();
-        return boost::shared_ptr<alert>(a->clone().release());
-#else
+        alert const* a;
+        {
+            allow_threading_guard guard;
+            a = s.wait_for_alert(milliseconds(ms));
+        }
         return a;
-#endif
     }
 
     list get_torrents(lt::session& s)
@@ -492,7 +420,7 @@ namespace
     list cached_piece_info_list(std::vector<cached_piece_info> const& v)
     {
        list pieces;
-       lt::time_point now = lt::clock_type::now();
+       time_point now = clock_type::now();
        for (std::vector<cached_piece_info>::const_iterator i = v.begin()
           , end(v.end()); i != end; ++i)
        {
@@ -543,7 +471,7 @@ namespace
     }
 #endif
 
-    entry save_state(lt::session const& s, boost::uint32_t flags)
+    entry save_state(lt::session const& s, std::uint32_t flags)
     {
         allow_threading_guard guard;
         entry e;
@@ -551,18 +479,6 @@ namespace
         return e;
     }
 
-#ifndef TORRENT_NO_DEPRECATE
-    object pop_alert(lt::session& ses)
-    {
-        std::auto_ptr<alert> a;
-        {
-            allow_threading_guard guard;
-            a = ses.pop_alert();
-        }
-
-        return object(boost::shared_ptr<alert>(a.release()));
-    }
-
     list pop_alerts(lt::session& ses)
     {
         std::vector<alert*> alerts;
@@ -572,33 +488,14 @@ namespace
         }
 
         list ret;
-        for (std::vector<alert*>::iterator i = alerts.begin()
-            , end(alerts.end()); i != end; ++i)
+        for (alert* a : alerts)
         {
-            ret.append(boost::shared_ptr<alert>((*i)->clone().release()));
+            ret.append(boost::python::ptr(a));
         }
         return ret;
     }
-#else
-    list pop_alerts(lt::session& ses)
-    {
-        std::vector<alert*> alerts;
-        {
-            allow_threading_guard guard;
-            ses.pop_alerts(&alerts);
-        }
 
-        list ret;
-        for (std::vector<alert*>::iterator i = alerts.begin()
-            , end(alerts.end()); i != end; ++i)
-        {
-            ret.append(boost::python::ptr(*i));
-        }
-        return ret;
-    }
-#endif
-
-	void load_state(lt::session& ses, entry const& st, boost::uint32_t flags)
+	void load_state(lt::session& ses, entry const& st, std::uint32_t flags)
 	{
 		allow_threading_guard guard;
 
@@ -615,40 +512,58 @@ namespace
     void dht_get_mutable_item(lt::session& ses, std::string key, std::string salt)
     {
         TORRENT_ASSERT(key.size() == 32);
-        boost::array<char, 32> public_key;
+        std::array<char, 32> public_key;
         std::copy(key.begin(), key.end(), public_key.begin());
         ses.dht_get_item(public_key, salt);
     }
 
-    void put_string(entry& e, boost::array<char, 64>& sig, boost::uint64_t& seq,
-                    std::string const& salt, std::string public_key, std::string private_key,
-                    std::string data)
+    void put_string(entry& e, std::array<char, 64>& sig, std::int64_t& seq
+        , std::string const& salt, std::string pk, std::string sk
+        , std::string data)
     {
-        using libtorrent::dht::sign_mutable_item;
+        using lt::dht::sign_mutable_item;
 
         e = data;
         std::vector<char> buf;
         bencode(std::back_inserter(buf), e);
         ++seq;
-        sign_mutable_item(std::pair<char const*, int>(&buf[0], buf.size())
-                          , std::pair<char const*, int>(&salt[0], salt.size())
-                          , seq, public_key.c_str(), private_key.c_str(), sig.data());
+        dht::signature sign = sign_mutable_item(buf, salt
+            , dht::sequence_number(seq)
+            , dht::public_key(pk.data())
+            , dht::secret_key(sk.data()));
+        sig = sign.bytes;
     }
 
     void dht_put_mutable_item(lt::session& ses, std::string private_key, std::string public_key,
-                              std::string data, std::string salt)
+        std::string data, std::string salt)
     {
         TORRENT_ASSERT(private_key.size() == 64);
         TORRENT_ASSERT(public_key.size() == 32);
-        boost::array<char, 32> key;
+        std::array<char, 32> key;
         std::copy(public_key.begin(), public_key.end(), key.begin());
-        ses.dht_put_item(key, boost::bind(&put_string, _1, _2, _3, _4
-                                          , public_key, private_key, data)
-                         , salt);
+        ses.dht_put_item(key, [&](entry& e, std::array<char, 64>& sig, std::int64_t& seq
+            , std::string const& salt) { put_string(e, sig, seq, salt
+                , public_key, private_key, data); }
+            , salt);
     }
 #endif
+
+    add_torrent_params read_resume_data_wrapper(bytes const& b)
+    {
+        error_code ec;
+        add_torrent_params p = read_resume_data(b.arr, ec);
+#ifndef BOOST_NO_EXCEPTIONS
+        if (ec) throw system_error(ec);
+#endif
+        return p;
+    }
+
 } // namespace unnamed
 
+struct dummy1 {};
+#ifndef TORRENT_NO_DEPRECATE
+struct dummy2 {};
+#endif
 
 void bind_session()
 {
@@ -729,6 +644,58 @@ void bind_session()
 #endif // TORRENT_DISABLE_DHT
 #endif // TORRENT_NO_DEPRECATE
 
+#define PROP(val) \
+    make_getter(val, return_value_policy<return_by_value>()), \
+    make_setter(val, return_value_policy<return_by_value>())
+
+    class_<add_torrent_params>("add_torrent_params")
+        .def_readwrite("version", &add_torrent_params::version)
+        .def_readwrite("ti", &add_torrent_params::ti)
+        .add_property("trackers", PROP(&add_torrent_params::trackers))
+        .add_property("tracker_tiers", PROP(&add_torrent_params::tracker_tiers))
+        .add_property("dht_nodes", PROP(&add_torrent_params::dht_nodes))
+        .def_readwrite("name", &add_torrent_params::name)
+        .def_readwrite("save_path", &add_torrent_params::save_path)
+        .def_readwrite("storage_mode", &add_torrent_params::storage_mode)
+//        .def_readwrite("storage", &add_torrent_params::storage)
+        .add_property("file_priorities", PROP(&add_torrent_params::file_priorities))
+        .def_readwrite("trackerid", &add_torrent_params::trackerid)
+        .def_readwrite("flags", &add_torrent_params::flags)
+        .def_readwrite("info_hash", &add_torrent_params::info_hash)
+        .def_readwrite("max_uploads", &add_torrent_params::max_uploads)
+        .def_readwrite("max_connections", &add_torrent_params::max_connections)
+        .def_readwrite("upload_limit", &add_torrent_params::upload_limit)
+        .def_readwrite("download_limit", &add_torrent_params::download_limit)
+        .def_readwrite("total_uploaded", &add_torrent_params::total_uploaded)
+        .def_readwrite("total_downloaded", &add_torrent_params::total_downloaded)
+        .def_readwrite("active_time", &add_torrent_params::active_time)
+        .def_readwrite("finished_time", &add_torrent_params::finished_time)
+        .def_readwrite("seeding_time", &add_torrent_params::seeding_time)
+        .def_readwrite("added_time", &add_torrent_params::added_time)
+        .def_readwrite("completed_time", &add_torrent_params::completed_time)
+        .def_readwrite("last_seen_complete", &add_torrent_params::last_seen_complete)
+        .def_readwrite("num_complete", &add_torrent_params::num_complete)
+        .def_readwrite("num_incomplete", &add_torrent_params::num_incomplete)
+        .def_readwrite("num_downloaded", &add_torrent_params::num_downloaded)
+        .add_property("http_seeds", PROP(&add_torrent_params::http_seeds))
+        .add_property("url_seeds", PROP(&add_torrent_params::url_seeds))
+        .add_property("peers", PROP(&add_torrent_params::peers))
+        .add_property("banned_peers", PROP(&add_torrent_params::banned_peers))
+        .add_property("unfinished_pieces", PROP(&add_torrent_params::unfinished_pieces))
+        .add_property("have_pieces", PROP(&add_torrent_params::have_pieces))
+        .add_property("verified_pieces", PROP(&add_torrent_params::verified_pieces))
+        .add_property("piece_priorities", PROP(&add_torrent_params::piece_priorities))
+        .add_property("merkle_tree", PROP(&add_torrent_params::merkle_tree))
+        .add_property("renamed_files", PROP(&add_torrent_params::renamed_files))
+
+#ifndef TORRENT_NO_DEPRECATE
+        .def_readwrite("url", &add_torrent_params::url)
+        .def_readwrite("uuid", &add_torrent_params::uuid)
+        .def_readwrite("resume_data", &add_torrent_params::resume_data)
+#endif
+      ;
+
+
     enum_<storage_mode_t>("storage_mode_t")
         .value("storage_mode_allocate", storage_mode_allocate)
         .value("storage_mode_sparse", storage_mode_sparse)
@@ -743,23 +710,48 @@ void bind_session()
         .value("start_default_features", lt::session::start_default_features)
     ;
 
-    enum_<add_torrent_params::flags_t>("add_torrent_params_flags_t")
-        .value("flag_seed_mode", add_torrent_params::flag_seed_mode)
-        .value("flag_override_resume_data", add_torrent_params::flag_override_resume_data)
-        .value("flag_upload_mode", add_torrent_params::flag_upload_mode)
-        .value("flag_share_mode", add_torrent_params::flag_share_mode)
-        .value("flag_apply_ip_filter", add_torrent_params::flag_apply_ip_filter)
-        .value("flag_paused", add_torrent_params::flag_paused)
-        .value("flag_auto_managed", add_torrent_params::flag_auto_managed)
-        .value("flag_duplicate_is_error", add_torrent_params::flag_duplicate_is_error)
-        .value("flag_merge_resume_trackers", add_torrent_params::flag_merge_resume_trackers)
-        .value("flag_update_subscribe", add_torrent_params::flag_update_subscribe)
-        .value("flag_super_seeding", add_torrent_params::flag_super_seeding)
-        .value("flag_sequential_download", add_torrent_params::flag_sequential_download)
-        .value("flag_use_resume_save_path", add_torrent_params::flag_use_resume_save_path)
-        .value("flag_merge_resume_http_seeds", add_torrent_params::flag_merge_resume_http_seeds)
-        .value("flag_stop_when_ready", add_torrent_params::flag_stop_when_ready)
-    ;
+
+    {
+    scope s = class_<dummy1>("torrent_flags");
+    s.attr("seed_mode") = torrent_flags::seed_mode;
+    s.attr("upload_mode") = torrent_flags::upload_mode;
+    s.attr("share_mode") = torrent_flags::share_mode;
+    s.attr("apply_ip_filter") = torrent_flags::apply_ip_filter;
+    s.attr("paused") = torrent_flags::paused;
+    s.attr("auto_managed") = torrent_flags::auto_managed;
+    s.attr("duplicate_is_error") = torrent_flags::duplicate_is_error;
+    s.attr("update_subscribe") = torrent_flags::update_subscribe;
+    s.attr("super_seeding") = torrent_flags::super_seeding;
+    s.attr("sequential_download") = torrent_flags::sequential_download;
+    s.attr("stop_when_ready") = torrent_flags::stop_when_ready;
+    s.attr("override_trackers") = torrent_flags::override_trackers;
+    s.attr("override_web_seeds") = torrent_flags::override_web_seeds;
+    }
+
+#ifndef TORRENT_NO_DEPRECATE
+    {
+    scope s = class_<dummy2>("add_torrent_params_flags_t");
+    s.attr("flag_seed_mode") = add_torrent_params::flag_seed_mode;
+    s.attr("flag_upload_mode") = add_torrent_params::flag_upload_mode;
+    s.attr("flag_share_mode") = add_torrent_params::flag_share_mode;
+    s.attr("flag_apply_ip_filter") = add_torrent_params::flag_apply_ip_filter;
+    s.attr("flag_paused") = add_torrent_params::flag_paused;
+    s.attr("flag_auto_managed") = add_torrent_params::flag_auto_managed;
+    s.attr("flag_duplicate_is_error") = add_torrent_params::flag_duplicate_is_error;
+    s.attr("flag_update_subscribe") = add_torrent_params::flag_update_subscribe;
+    s.attr("flag_super_seeding") = add_torrent_params::flag_super_seeding;
+    s.attr("flag_sequential_download") = add_torrent_params::flag_sequential_download;
+    s.attr("flag_stop_when_ready") = add_torrent_params::flag_stop_when_ready;
+    s.attr("flag_override_trackers") = add_torrent_params::flag_override_trackers;
+    s.attr("flag_override_web_seeds") = add_torrent_params::flag_override_web_seeds;
+    s.attr("flag_pinned") = add_torrent_params::flag_pinned;
+    s.attr("flag_override_resume_data") = add_torrent_params::flag_override_resume_data;
+    s.attr("flag_merge_resume_trackers") = add_torrent_params::flag_merge_resume_trackers;
+    s.attr("flag_use_resume_save_path") = add_torrent_params::flag_use_resume_save_path;
+    s.attr("flag_merge_resume_http_seeds") = add_torrent_params::flag_merge_resume_http_seeds;
+    }
+#endif
+
     class_<cache_status>("cache_status")
         .add_property("pieces", cache_status_pieces)
 #ifndef TORRENT_NO_DEPRECATE
@@ -807,7 +799,7 @@ void bind_session()
         )
 #ifndef TORRENT_NO_DEPRECATE
         .def(
-            init<fingerprint, int, boost::uint32_t>((
+            init<fingerprint, int, std::uint32_t>((
                 arg("fingerprint")=fingerprint("LT",0,1,0,0)
                 , arg("flags")=lt::session::start_default_features | lt::session::add_default_plugins
                 , arg("alert_mask")=int(alert::error_notification)))
@@ -838,6 +830,8 @@ void bind_session()
 #endif // TORRENT_DISABLE_DHT
         .def("add_torrent", &add_torrent)
         .def("async_add_torrent", &async_add_torrent)
+        .def("async_add_torrent", &lt::session::async_add_torrent)
+        .def("add_torrent", allow_threads((lt::torrent_handle (session_handle::*)(add_torrent_params const&))&lt::session::add_torrent))
 #ifndef BOOST_NO_EXCEPTIONS
 #ifndef TORRENT_NO_DEPRECATE
         .def(
@@ -852,10 +846,7 @@ void bind_session()
 #endif // BOOST_NO_EXCEPTIONS
         .def("remove_torrent", allow_threads(&lt::session::remove_torrent), arg("option") = 0)
 #ifndef TORRENT_NO_DEPRECATE
-        .def("add_feed", &add_feed)
         .def("status", allow_threads(&lt::session::status))
-        .def("settings", &lt::session::settings)
-        .def("set_settings", &session_set_settings)
 #endif
         .def("get_settings", &session_get_settings)
         .def("apply_settings", &session_apply_settings)
@@ -868,14 +859,9 @@ void bind_session()
         .def("load_state", &load_state, (arg("entry"), arg("flags") = 0xffffffff))
         .def("save_state", &save_state, (arg("entry"), arg("flags") = 0xffffffff))
         .def("pop_alerts", &pop_alerts)
-        .def("wait_for_alert", &wait_for_alert
-#ifdef TORRENT_NO_DEPRECATE
-            , return_internal_reference<>()
-#endif
-        )
+        .def("wait_for_alert", &wait_for_alert, return_internal_reference<>())
         .def("add_extension", &add_extension)
 #ifndef TORRENT_NO_DEPRECATE
-        .def("pop_alert", &pop_alert)
 #if TORRENT_USE_I2P
         .def("set_i2p_proxy", allow_threads(&lt::session::set_i2p_proxy))
         .def("i2p_proxy", allow_threads(&lt::session::i2p_proxy))
@@ -896,7 +882,7 @@ void bind_session()
 #ifndef TORRENT_NO_DEPRECATE
         .def(
             "listen_on", &listen_on
-          , (arg("min"), "max", arg("interface") = (char const*)0, arg("flags") = 0)
+          , (arg("min"), "max", arg("interface") = (char const*)nullptr, arg("flags") = 0)
         )
 #ifndef TORRENT_DISABLE_DHT
         .def("start_dht", allow_threads(start_dht0))
@@ -968,25 +954,12 @@ void bind_session()
         .value("listen_reuse_address", lt::session::listen_reuse_address)
         .value("listen_no_system_port", lt::session::listen_no_system_port)
     ;
-
-    class_<feed_handle>("feed_handle")
-        .def("update_feed", &feed_handle::update_feed)
-        .def("get_feed_status", &get_feed_status)
-        .def("set_settings", &set_feed_settings)
-        .def("settings", &get_feed_settings)
-    ;
-
-    typedef session_settings (*mem_preset1)();
-    typedef session_settings (*perf_preset1)();
-
-    def("high_performance_seed", (perf_preset1)high_performance_seed);
-    def("min_memory_usage", (mem_preset1)min_memory_usage);
-    scope().attr("create_metadata_plugin") = "metadata_transfer";
 #endif
 
     def("high_performance_seed", high_performance_seed_wrapper);
     def("min_memory_usage", min_memory_usage_wrapper);
     def("default_settings", default_settings_wrapper);
+    def("read_resume_data", read_resume_data_wrapper);
 
 	class_<stats_metric>("stats_metric")
 		.def_readonly("name", &stats_metric::name)
@@ -1002,3 +975,6 @@ void bind_session()
     scope().attr("create_smart_ban_plugin") = "smart_ban";
 }
 
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
